@@ -161,6 +161,29 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     setenv("NCCL_GRAPH_REGISTER", "0", 0);
 #endif // _WIN32
+    // ncclCommInitRank binds the new communicator to the *current* CUDA device.
+    // The calling thread may not have set its device (e.g. comm creation during
+    // warmup/autotuning, before the executor loop's set_device runs), leaving it
+    // at the default device 0 for every rank -- which NCCL rejects as a
+    // duplicate GPU. Set this rank's device first, mirroring the worker mapping
+    // (global_rank % device_count, see base_worker.py).
+    {
+        int deviceCount = 0;
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+        if (deviceCount > 0)
+        {
+            int curDevice = -1;
+            cudaGetDevice(&curDevice);
+            int const targetDevice = static_cast<int>(rank % deviceCount);
+            if (curDevice != targetDevice)
+            {
+                TLLM_LOG_WARNING("[getComm] rank %d: current CUDA device %d != rank device %d; setting it before "
+                                 "ncclCommInitRank",
+                    rank, curDevice, targetDevice);
+                TLLM_CUDA_CHECK(cudaSetDevice(targetDevice));
+            }
+        }
+    }
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
