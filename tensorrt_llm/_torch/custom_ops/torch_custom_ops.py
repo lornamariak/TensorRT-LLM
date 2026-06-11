@@ -24,7 +24,7 @@ import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import confidential_compute_enabled, get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
@@ -1903,6 +1903,10 @@ class AllReduceRunner(TunableRunner):
         self.group = group
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
+        # Cache the CC state once (NVML query is not free; do it at construction,
+        # not on the per-reduction fallback path). Under Confidential Computing
+        # NVLS is disabled, which changes the optimal cache-miss fallback below.
+        self._cc_enabled = confidential_compute_enabled()
 
     def unique_id(self):
         return (
@@ -2014,11 +2018,20 @@ class AllReduceRunner(TunableRunner):
                 )
             return input
         if tactic == -1:
-            # tactic == -1 means the autotuner cache missed for this shape;
-            # fall back to NCCL_SYMMETRIC. Asymmetric ncclMemAlloc failures are
-            # handled by a cross-rank barrier in NCCLWindowAllocator, which
-            # falls back to plain NCCL if allocation fails on any rank.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # tactic == -1 means the autotuner cache missed for this shape
+            # (common for dynamic prefill lengths that never match the profiled
+            # buckets). NCCL_SYMMETRIC only beats plain NCCL when NVLS multicast
+            # is available; under Confidential Computing NVLS is disabled, so the
+            # symmetric path degrades to a ring reduction while still paying the
+            # ncclMemAlloc + ncclCommWindowRegister + cross-rank barrier cost,
+            # making it slower than plain NCCL. Pick the fallback to match what
+            # NVLS availability makes optimal.
+            # Non-CC: NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are still
+            # handled by the cross-rank barrier in NCCLWindowAllocator.
+            if self._cc_enabled:
+                tactic = AllReduceStrategy.NCCL.value
+            else:
+                tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
         return torch.ops.trtllm.allreduce(
             input,
