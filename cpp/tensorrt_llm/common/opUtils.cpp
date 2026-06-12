@@ -170,18 +170,18 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     {
         int deviceCount = 0;
         TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+        int curDevice = -1;
+        cudaGetDevice(&curDevice);
+        int const targetDevice = (deviceCount > 0) ? static_cast<int>(rank % deviceCount) : curDevice;
+        // Unconditional: always log + always set, so (a) we can confirm this path
+        // runs and on which device, and (b) the comm is created on this rank's GPU
+        // even if the calling thread never set its device (warmup/autotuner thread
+        // defaults to device 0 -> all ranks collide -> NCCL "Duplicate GPU").
+        TLLM_LOG_WARNING("[getComm] rank %d group(%s): curDev=%d targetDev=%d deviceCount=%d", rank, groupStr.c_str(),
+            curDevice, targetDevice, deviceCount);
         if (deviceCount > 0)
         {
-            int curDevice = -1;
-            cudaGetDevice(&curDevice);
-            int const targetDevice = static_cast<int>(rank % deviceCount);
-            if (curDevice != targetDevice)
-            {
-                TLLM_LOG_WARNING("[getComm] rank %d: current CUDA device %d != rank device %d; setting it before "
-                                 "ncclCommInitRank",
-                    rank, curDevice, targetDevice);
-                TLLM_CUDA_CHECK(cudaSetDevice(targetDevice));
-            }
+            TLLM_CUDA_CHECK(cudaSetDevice(targetDevice));
         }
     }
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
